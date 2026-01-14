@@ -1,0 +1,21 @@
+node_modules/
+.env
+.env.*
+*.log
+
+# Databases / dumps
+db/
+*.dump
+*.sql
+
+# Debug / output
+ftn_debug/
+results*.json
+
+# IDEs
+.idea/
+.vscode/
+
+# OS junk
+.DS_Store
+Thumbs.db
