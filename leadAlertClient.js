@@ -8,8 +8,13 @@ const PROD_ALERT_URL =
 // Normalize industry to what your API expects
 function canonIndustry(s = '') {
     const v = s.trim().toLowerCase();
+
     if (['pool', 'pool service', 'pool maintenance'].includes(v)) return 'pool';
-    if (['handyman', 'plumber', 'plumbing'].includes(v)) return 'handyman';
+
+    if (['handyman'].includes(v)) return 'handyman';
+
+    if (['plumber', 'plumbing'].includes(v)) return 'plumber';
+
     if (
         [
             'housecleaner',
@@ -21,9 +26,18 @@ function canonIndustry(s = '') {
             'house-keeper',
             'housekeeper',
         ].includes(v)
-    )
+    ) {
         return 'housecleaner';
-    if (['lawncare', 'lawn care', 'landscaping'].includes(v)) return 'lawncare';
+    }
+
+    if (['lawncare', 'lawn care', 'lawn_care'].includes(v)) {
+        return 'lawn_care';
+    }
+
+    if (['landscaping', 'landscaper'].includes(v)) {
+        return 'landscaping';
+    }
+
     return v || null;
 }
 
@@ -44,6 +58,9 @@ async function postLeadAlert({
                                  location = null,
                                  physical_address = null,
                                  message_sent_at = null,
+                                 company_name = null,
+                                 professionalnumbertocall = null,
+                                 networkingsource = null,
                              }) {
     const payload = {
         name: (name || '').trim(),
@@ -55,6 +72,9 @@ async function postLeadAlert({
         location,
         physical_address,
         message_sent_at,
+        company_name,
+        professionalnumbertocall,
+        networkingsource,
     };
 
     if (!payload.name || !payload.phone || !payload.lead_type) {

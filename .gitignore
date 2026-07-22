@@ -4,7 +4,6 @@ node_modules/
 *.log
 
 # Databases / dumps
-db/
 *.dump
 *.sql
 
