@@ -4,17 +4,6 @@
 
 require("dotenv").config();
 
-let nodemailer = null;
-
-try {
-    nodemailer = require("nodemailer");
-} catch (error) {
-    console.warn(
-        "⚠️ nodemailer is not installed. Email alerts will be disabled " +
-        "until you run: npm install nodemailer"
-    );
-}
-
 const pool = require("./db/db.js");
 
 const {
@@ -34,38 +23,12 @@ const PROD_ALERT_URL =
     process.env.LEAD_ALERT_URL ||
     `${BASE_URL}/api/smsqueue/alert-lead`;
 
-const {
-    ZEPTOMAIL_FROM_NAME,
-    ZEPTOMAIL_FROM_EMAIL,
-    ZEPTOMAIL_SMTP_HOST,
-    ZEPTOMAIL_SMTP_PORT,
-    ZEPTOMAIL_SMTP_USER,
-    ZEPTOMAIL_SMTP_PASSWORD
-} = process.env;
+const FAMILYTREE_EMAIL_ALERT_URL =
+    process.env.FAMILYTREE_EMAIL_ALERT_URL ||
+    "https://crm-function-app-5d4de511071d.herokuapp.com/server/lead_function/api/leads/send-familytree-alerts";
 
-const EMAIL_SMTP_HOST =
-    cleanText(ZEPTOMAIL_SMTP_HOST);
-
-const EMAIL_SMTP_PORT =
-    Number(ZEPTOMAIL_SMTP_PORT || 587);
-
-const EMAIL_SMTP_USER =
-    cleanText(ZEPTOMAIL_SMTP_USER);
-
-const EMAIL_SMTP_PASSWORD =
-    cleanText(ZEPTOMAIL_SMTP_PASSWORD);
-
-const EMAIL_FROM_ADDRESS =
-    cleanText(ZEPTOMAIL_FROM_EMAIL);
-
-const EMAIL_FROM_NAME =
-    cleanText(ZEPTOMAIL_FROM_NAME) ||
-    "Clubhouse Links";
-
-const EMAIL_SMTP_SECURE =
-    EMAIL_SMTP_PORT === 465;
-
-let emailTransporter = null;
+const FTN_ALERT_SECRET =
+    String(process.env.FTN_ALERT_SECRET || "").trim();
 
 /*
  * Compare phone numbers using the final 10 digits.
@@ -87,6 +50,12 @@ function normalizePhone(value) {
     }
 
     return digits.slice(-10);
+}
+
+function normalizeCompanyName(value) {
+    return cleanText(value)
+        .toLowerCase()
+        .replace(/\s+/g, " ");
 }
 
 function asArray(value) {
@@ -131,37 +100,6 @@ function escapeHtml(value) {
         .replace(/>/g, "&gt;")
         .replace(/"/g, "&quot;")
         .replace(/'/g, "&#039;");
-}
-
-function emailAlertsConfigured() {
-    return Boolean(
-        nodemailer &&
-        EMAIL_SMTP_HOST &&
-        EMAIL_SMTP_USER &&
-        EMAIL_SMTP_PASSWORD &&
-        EMAIL_FROM_ADDRESS
-    );
-}
-
-function getEmailTransporter() {
-    if (!emailAlertsConfigured()) {
-        return null;
-    }
-
-    if (!emailTransporter) {
-        emailTransporter =
-            nodemailer.createTransport({
-                host: EMAIL_SMTP_HOST,
-                port: EMAIL_SMTP_PORT,
-                secure: EMAIL_SMTP_SECURE,
-                auth: {
-                    user: EMAIL_SMTP_USER,
-                    pass: EMAIL_SMTP_PASSWORD
-                }
-            });
-    }
-
-    return emailTransporter;
 }
 
 /*
@@ -295,11 +233,9 @@ async function loadVendorPushDirectory() {
 /*
  * Load users who explicitly enabled email lead alerts.
  *
- * The Map is keyed by the normalized users.phone_number so the email
- * recipient can be matched against familytreenow.professionalnumbertocall.
- *
- * Email is an ADDITIONAL channel. It does not remove the recipient from
- * either the existing APNs or Twilio paths.
+ * Email routing is based on users.company_name matching the aligned
+ * familytreenow.company_name entry. Phone-number matching is not used
+ * for email delivery.
  */
 async function loadEmailAlertDirectory() {
     try {
@@ -308,8 +244,7 @@ async function loadEmailAlertDirectory() {
                 id AS user_id,
                 name,
                 company_name,
-                email,
-                phone_number
+                email
 
             FROM users
 
@@ -324,26 +259,29 @@ async function loadEmailAlertDirectory() {
                   ) IS NOT NULL
 
               AND NULLIF(
-                    BTRIM(phone_number),
+                    BTRIM(company_name),
                     ''
                   ) IS NOT NULL
 
             ORDER BY id ASC
         `);
 
-        const usersByPhone =
+        const usersById =
             new Map();
 
-        const usersById =
+        const usersByCompany =
             new Map();
 
         for (const row of rows) {
             const userId =
                 Number(row.user_id);
 
-            const normalizedPhone =
-                normalizePhone(
-                    row.phone_number
+            const companyName =
+                cleanText(row.company_name);
+
+            const normalizedCompanyName =
+                normalizeCompanyName(
+                    companyName
                 );
 
             const email =
@@ -351,7 +289,7 @@ async function loadEmailAlertDirectory() {
 
             if (
                 !userId ||
-                !normalizedPhone ||
+                !normalizedCompanyName ||
                 !email
             ) {
                 continue;
@@ -361,12 +299,9 @@ async function loadEmailAlertDirectory() {
                 userId,
                 name:
                     cleanText(row.name),
-                companyName:
-                    cleanText(row.company_name),
-                email,
-                phone:
-                row.phone_number,
-                normalizedPhone
+                companyName,
+                normalizedCompanyName,
+                email
             };
 
             usersById.set(
@@ -374,22 +309,22 @@ async function loadEmailAlertDirectory() {
                 user
             );
 
-            const phoneMatches =
-                usersByPhone.get(
-                    normalizedPhone
+            const companyMatches =
+                usersByCompany.get(
+                    normalizedCompanyName
                 ) || [];
 
-            phoneMatches.push(user);
+            companyMatches.push(user);
 
-            usersByPhone.set(
-                normalizedPhone,
-                phoneMatches
+            usersByCompany.set(
+                normalizedCompanyName,
+                companyMatches
             );
         }
 
         return {
             usersById,
-            usersByPhone
+            usersByCompany
         };
     } catch (error) {
         if (error?.code === "42703") {
@@ -400,7 +335,7 @@ async function loadEmailAlertDirectory() {
 
             return {
                 usersById: new Map(),
-                usersByPhone: new Map()
+                usersByCompany: new Map()
             };
         }
 
@@ -408,188 +343,130 @@ async function loadEmailAlertDirectory() {
     }
 }
 
-function buildLeadEmailSubject(lead) {
-    const leadType =
-        cleanText(lead.lead_type) ||
-        "Home Service";
-
-    const location =
-        [
-            cleanText(lead.city),
-            cleanText(lead.state)
-        ]
-            .filter(Boolean)
-            .join(", ");
-
-    return truncate(
-        location
-            ? `New ${leadType} Lead in ${location}`
-            : `New ${leadType} Lead`,
-        150
+function herokuEmailEndpointConfigured() {
+    return Boolean(
+        cleanText(FAMILYTREE_EMAIL_ALERT_URL) &&
+        FTN_ALERT_SECRET
     );
 }
 
-function buildLeadEmailContent(
-    lead,
-    recipient
-) {
-    const recipientName =
-        cleanText(recipient.name) ||
-        cleanText(recipient.companyName) ||
-        "there";
-
-    const leadName =
-        cleanText(lead.name) ||
-        "Not provided";
-
-    const leadPhone =
-        cleanText(lead.phone) ||
-        "Not provided";
-
-    const leadType =
-        cleanText(lead.lead_type) ||
-        "Home Service";
-
-    const location =
-        [
-            cleanText(lead.city),
-            cleanText(lead.state)
-        ]
-            .filter(Boolean)
-            .join(", ") ||
-        "Not provided";
-
-    const address =
-        cleanText(lead.physical_address) ||
-        cleanText(lead.location) ||
-        "Not provided";
-
-    const description =
-        cleanText(lead.description) ||
-        "No description was provided.";
-
-    const text = [
-        `Hello ${recipientName},`,
-        "",
-        "A new FamilyTreeNow lead is available for you.",
-        "",
-        `Lead: ${leadName}`,
-        `Phone: ${leadPhone}`,
-        `Lead type: ${leadType}`,
-        `Location: ${location}`,
-        `Address: ${address}`,
-        "",
-        "Description:",
-        description,
-        "",
-        "Clubhouse Links"
-    ].join("\n");
-
-    const html = `
-        <div style="max-width:680px;margin:0 auto;padding:28px 20px;font-family:Verdana,Arial,Helvetica,sans-serif;font-size:15px;line-height:1.65;color:#111827;">
-            <h2 style="margin:0 0 18px;">New ${escapeHtml(leadType)} Lead</h2>
-
-            <p>Hello ${escapeHtml(recipientName)},</p>
-
-            <p>
-                A new FamilyTreeNow lead is available for you.
-            </p>
-
-            <table style="width:100%;border-collapse:collapse;margin:20px 0;">
-                <tr>
-                    <td style="padding:8px 0;font-weight:bold;vertical-align:top;">Lead</td>
-                    <td style="padding:8px 0;">${escapeHtml(leadName)}</td>
-                </tr>
-                <tr>
-                    <td style="padding:8px 0;font-weight:bold;vertical-align:top;">Phone</td>
-                    <td style="padding:8px 0;">
-                        ${
-        leadPhone !== "Not provided"
-            ? `<a href="tel:${escapeHtml(leadPhone)}">${escapeHtml(leadPhone)}</a>`
-            : escapeHtml(leadPhone)
+function emailEndpointReportedSuccess(data) {
+    if (!data || typeof data !== "object") {
+        return false;
     }
-                    </td>
-                </tr>
-                <tr>
-                    <td style="padding:8px 0;font-weight:bold;vertical-align:top;">Lead type</td>
-                    <td style="padding:8px 0;">${escapeHtml(leadType)}</td>
-                </tr>
-                <tr>
-                    <td style="padding:8px 0;font-weight:bold;vertical-align:top;">Location</td>
-                    <td style="padding:8px 0;">${escapeHtml(location)}</td>
-                </tr>
-                <tr>
-                    <td style="padding:8px 0;font-weight:bold;vertical-align:top;">Address</td>
-                    <td style="padding:8px 0;">${escapeHtml(address)}</td>
-                </tr>
-            </table>
 
-            <div style="padding:16px;background:#f3f4f6;border-radius:10px;">
-                <strong>Description</strong>
-                <div style="margin-top:8px;white-space:pre-wrap;">${escapeHtml(description)}</div>
-            </div>
+    if (
+        data.sent === true ||
+        Number(data.emails_sent || 0) > 0
+    ) {
+        return true;
+    }
 
-            <p style="margin-top:24px;">Clubhouse Links</p>
-        </div>
-    `;
+    if (
+        Array.isArray(data.results) &&
+        data.results.some(
+            (result) =>
+                result?.sent === true ||
+                result?.success === true
+        )
+    ) {
+        return true;
+    }
 
-    return {
-        subject:
-            buildLeadEmailSubject(lead),
-        text,
-        html
-    };
+    return data.success === true;
 }
 
-async function sendLeadEmailToUser(
+async function sendLeadEmailThroughHeroku(
     lead,
     recipient
 ) {
-    const transporter =
-        getEmailTransporter();
-
-    if (!transporter) {
+    if (!herokuEmailEndpointConfigured()) {
         return {
             channel: "email",
             success: false,
             skipped: true,
             userId: recipient.userId,
             email: recipient.email,
-            reason: "email_not_configured"
+            companyName: recipient.companyName,
+            reason: "heroku_email_endpoint_not_configured"
         };
     }
 
-    const content =
-        buildLeadEmailContent(
-            lead,
-            recipient
+    if (typeof fetch !== "function") {
+        throw new Error(
+            "Global fetch is unavailable. Use Node.js 18 or newer."
+        );
+    }
+
+    const response =
+        await fetch(
+            FAMILYTREE_EMAIL_ALERT_URL,
+            {
+                method: "POST",
+                headers: {
+                    "Content-Type":
+                        "application/json",
+                    "x-ftn-alert-secret":
+                    FTN_ALERT_SECRET
+                },
+                body: JSON.stringify({
+                    lead_id:
+                    lead.id,
+                    user_id:
+                    recipient.userId,
+                    company_name:
+                    recipient.companyName
+                })
+            }
         );
 
-    const info =
-        await transporter.sendMail({
-            from: {
-                name: EMAIL_FROM_NAME,
-                address: EMAIL_FROM_ADDRESS
-            },
-            to: recipient.email,
-            subject: content.subject,
-            text: content.text,
-            html: content.html
-        });
+    const responseText =
+        await response.text();
+
+    let data = null;
+
+    if (responseText) {
+        try {
+            data =
+                JSON.parse(responseText);
+        } catch (_) {
+            data = {
+                raw_response:
+                responseText
+            };
+        }
+    }
+
+    if (!response.ok) {
+        throw new Error(
+            `Heroku email endpoint returned ${response.status}: ` +
+            `${responseText || response.statusText}`
+        );
+    }
+
+    const success =
+        emailEndpointReportedSuccess(data);
 
     console.log(
-        `✅ Email delivered for lead ${lead.id} to ` +
-        `${recipient.email} (users.id=${recipient.userId})`
+        `📧 Heroku email endpoint result for lead ${lead.id}, ` +
+        `users.id=${recipient.userId}, ` +
+        `company=${recipient.companyName}:`,
+        data
     );
 
     return {
         channel: "email",
-        success: true,
+        success,
         skipped: false,
         userId: recipient.userId,
         email: recipient.email,
-        messageId:
-            info?.messageId || null
+        companyName: recipient.companyName,
+        status: response.status,
+        data,
+        reason:
+            success
+                ? null
+                : "endpoint_did_not_report_success"
     };
 }
 
@@ -847,7 +724,7 @@ function buildSmsPayload(
 
         const {
             usersById: emailAlertUsersById,
-            usersByPhone: emailAlertUsersByPhone
+            usersByCompany: emailAlertUsersByCompany
         } =
             await loadEmailAlertDirectory();
 
@@ -856,14 +733,14 @@ function buildSmsPayload(
             "with alert_email = TRUE"
         );
 
-        if (emailAlertsConfigured()) {
+        if (herokuEmailEndpointConfigured()) {
             console.log(
-                `✅ Email alert channel is configured through ` +
-                `${EMAIL_SMTP_HOST}:${EMAIL_SMTP_PORT}`
+                "✅ Heroku email alert endpoint is configured:",
+                FAMILYTREE_EMAIL_ALERT_URL
             );
         } else {
             console.log(
-                "⚠️ Email alert channel is not fully configured. " +
+                "⚠️ Heroku email alert endpoint is not fully configured. " +
                 "Existing APNs and Twilio delivery will continue normally."
             );
         }
@@ -987,10 +864,14 @@ function buildSmsPayload(
                 );
 
             /*
-             * A lead may contain multiple destination companies.
+             * Each aligned company/phone destination follows three layers:
              *
-             * HOA vendor matches are removed from the Twilio list
-             * and routed to APNs instead.
+             * 1. A professional phone matching hoa_vendors receives APNs.
+             * 2. A company matching users.company_name with alert_email = TRUE
+             *    receives email through the Heroku endpoint. This is independent
+             *    of APNs and Twilio.
+             * 3. Twilio receives only professional phones that did not match
+             *    an HOA vendor in layer 1.
              */
             const matchedVendors =
                 new Map();
@@ -1026,38 +907,42 @@ function buildSmsPayload(
                     continue;
                 }
 
+                const originalCompanyName =
+                    cleanText(
+                        companyNames[index]
+                    );
+
+                const normalizedCompanyName =
+                    normalizeCompanyName(
+                        originalCompanyName
+                    );
+
                 const emailMatches =
-                    emailAlertUsersByPhone.get(
-                        normalizedPhone
-                    ) || [];
+                    normalizedCompanyName
+                        ? emailAlertUsersByCompany.get(
+                        normalizedCompanyName
+                    ) || []
+                        : [];
 
                 for (
                     const emailUser
                     of emailMatches
                     ) {
-                    const emailKey =
-                        cleanText(
-                            emailUser.email
-                        ).toLowerCase();
-
-                    if (!emailKey) {
-                        continue;
-                    }
-
                     if (
                         !matchedEmailUsers.has(
-                            emailKey
+                            emailUser.userId
                         )
                     ) {
                         matchedEmailUsers.set(
-                            emailKey,
+                            emailUser.userId,
                             emailUser
                         );
 
                         console.log(
-                            `📧 ${originalPhone} matches users.id=` +
-                            `${emailUser.userId} (${emailUser.email}) — ` +
-                            "adding email alert"
+                            `📧 ${originalCompanyName} matches ` +
+                            `users.id=${emailUser.userId} ` +
+                            `(${emailUser.email}) with ` +
+                            `alert_email = TRUE — adding Heroku email alert`
                         );
                     }
                 }
@@ -1152,54 +1037,47 @@ function buildSmsPayload(
                 );
 
             /*
-             * Email is an additional alert channel. A recipient can receive
-             * email and still continue through the existing APNs/Twilio logic.
+             * Email is an independent second layer. Company-name matches with
+             * users.alert_email = TRUE call the Heroku email endpoint whether
+             * or not the same destination also matched an HOA vendor.
              */
             const emailResults = [];
 
-            if (matchedEmailUsers.size) {
-                if (!emailAlertsConfigured()) {
-                    console.log(
-                        `⚠️ Lead ${lead.id} matched ` +
-                        `${matchedEmailUsers.size} email recipient(s), ` +
-                        "but SMTP email alerts are not configured."
+            for (
+                const emailUser
+                of matchedEmailUsers.values()
+                ) {
+                try {
+                    const emailResult =
+                        await sendLeadEmailThroughHeroku(
+                            lead,
+                            emailUser
+                        );
+
+                    emailResults.push(
+                        emailResult
                     );
-                } else {
-                    for (
-                        const emailUser
-                        of matchedEmailUsers.values()
-                        ) {
-                        try {
-                            const emailResult =
-                                await sendLeadEmailToUser(
-                                    lead,
-                                    emailUser
-                                );
+                } catch (error) {
+                    console.error(
+                        `💥 Heroku email error for lead ${lead.id}, ` +
+                        `users.id=${emailUser.userId}, ` +
+                        `${emailUser.email}:`,
+                        error.message
+                    );
 
-                            emailResults.push(
-                                emailResult
-                            );
-                        } catch (error) {
-                            console.error(
-                                `💥 Email error for lead ${lead.id}, ` +
-                                `users.id=${emailUser.userId}, ` +
-                                `${emailUser.email}:`,
-                                error.message
-                            );
-
-                            emailResults.push({
-                                channel: "email",
-                                success: false,
-                                skipped: false,
-                                userId:
-                                emailUser.userId,
-                                email:
-                                emailUser.email,
-                                reason:
-                                error.message
-                            });
-                        }
-                    }
+                    emailResults.push({
+                        channel: "email",
+                        success: false,
+                        skipped: false,
+                        userId:
+                        emailUser.userId,
+                        email:
+                        emailUser.email,
+                        companyName:
+                        emailUser.companyName,
+                        reason:
+                        error.message
+                    });
                 }
             }
 
@@ -1210,8 +1088,8 @@ function buildSmsPayload(
                 );
 
             /*
-             * Continue using the existing Twilio endpoint for
-             * destination numbers that are not HOA vendors.
+             * Third layer: use the existing Twilio endpoint only for
+             * destination numbers that did not match hoa_vendors.
              */
             let twilioApiResult = null;
             let twilioResults = [];
