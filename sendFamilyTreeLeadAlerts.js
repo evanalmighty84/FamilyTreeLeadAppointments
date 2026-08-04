@@ -31,6 +31,27 @@ const FTN_ALERT_SECRET =
     String(process.env.FTN_ALERT_SECRET || "").trim();
 
 /*
+ * Optional one-run filters:
+ *
+ * ONLY_COMPANY limits processing to an exact company_name array value.
+ * LEAD_LOOKBACK_DAYS defaults to 10. Set it to 0 to include all history.
+ */
+const ONLY_COMPANY =
+    String(process.env.ONLY_COMPANY || "").trim();
+
+const parsedLeadLookbackDays =
+    Number.parseInt(
+        process.env.LEAD_LOOKBACK_DAYS || "10",
+        10
+    );
+
+const LEAD_LOOKBACK_DAYS =
+    Number.isInteger(parsedLeadLookbackDays) &&
+    parsedLeadLookbackDays >= 0
+        ? parsedLeadLookbackDays
+        : 10;
+
+/*
  * Compare phone numbers using the final 10 digits.
  *
  * This makes all of these match:
@@ -470,6 +491,107 @@ async function sendLeadEmailThroughHeroku(
     };
 }
 
+/*
+ * Create or refresh the vendor inbox item before sending APNs.
+ *
+ * The unique key on (source, source_lead_id, vendor_id) makes this safe
+ * to run again: retries reuse the same inbox row instead of creating a
+ * duplicate request.
+ */
+async function createOrUpdateVendorInboxRequest(
+    lead,
+    vendor
+) {
+    const service =
+        cleanText(lead.lead_type) ||
+        "Home Service";
+
+    const subService =
+        cleanText(lead.lead_type) ||
+        null;
+
+    const message =
+        cleanText(lead.description) ||
+        "New homeowner lead from FamilyTreeNow.";
+
+    const leadAddress =
+        cleanText(lead.physical_address) ||
+        cleanText(lead.location) ||
+        null;
+
+    const { rows } = await pool.query(
+        `
+            INSERT INTO hoa_service_requests (
+                resident_id,
+                vendor_id,
+                service,
+                sub_service,
+                message,
+                status,
+                source,
+                source_lead_id,
+                lead_name,
+                lead_phone,
+                lead_address,
+                lead_city,
+                lead_state
+            )
+            VALUES (
+                NULL,
+                $1,
+                $2,
+                $3,
+                $4,
+                'new',
+                'familytreenow',
+                $5,
+                $6,
+                $7,
+                $8,
+                $9,
+                $10
+            )
+            ON CONFLICT (
+                source,
+                source_lead_id,
+                vendor_id
+            )
+            DO UPDATE SET
+                service = EXCLUDED.service,
+                sub_service = EXCLUDED.sub_service,
+                message = EXCLUDED.message,
+                lead_name = EXCLUDED.lead_name,
+                lead_phone = EXCLUDED.lead_phone,
+                lead_address = EXCLUDED.lead_address,
+                lead_city = EXCLUDED.lead_city,
+                lead_state = EXCLUDED.lead_state
+            RETURNING
+                id,
+                vendor_id,
+                service,
+                sub_service,
+                status,
+                source,
+                source_lead_id,
+                created_at
+        `,
+        [
+            vendor.vendorId,
+            service,
+            subService,
+            message,
+            lead.id,
+            cleanText(lead.name) || "Homeowner",
+            cleanText(lead.phone) || null,
+            leadAddress,
+            cleanText(lead.city) || null,
+            cleanText(lead.state) || null
+        ]
+    );
+
+    return rows[0];
+}
+
 function buildNotificationTitle(lead) {
     const leadType =
         cleanText(lead.lead_type) ||
@@ -516,12 +638,14 @@ function buildNotificationBody(lead) {
  */
 async function sendLeadPushToVendor(
     lead,
-    vendor
+    vendor,
+    request
 ) {
     if (!vendor.devices.length) {
         console.log(
             `⚠️ ${vendor.companyName} matches an HOA vendor, ` +
-            "but has no active APNs device."
+            "but has no active APNs device. " +
+            `Inbox request ${request.id} was still created.`
         );
 
         return [];
@@ -534,7 +658,7 @@ async function sendLeadPushToVendor(
         buildNotificationBody(lead);
 
     console.log(
-        `🔔 Sending HOA vendor push to ` +
+        `🔔 Sending inbox request ${request.id} to ` +
         `${vendor.companyName} ` +
         `(${vendor.devices.length} device(s))`
     );
@@ -554,11 +678,8 @@ async function sendLeadPushToVendor(
                             title,
                             body,
 
-                            /*
-                             * Do not pass requestId.
-                             * This is not a hoa_service_requests row.
-                             */
-                            requestId: null,
+                            requestId:
+                                String(request.id),
 
                             vendorId:
                             vendor.vendorId,
@@ -606,7 +727,8 @@ async function sendLeadPushToVendor(
 
                     if (pushResult.success) {
                         console.log(
-                            `✅ APNs delivered lead ${lead.id} ` +
+                            `✅ APNs delivered lead ${lead.id}, ` +
+                            `inbox request ${request.id}, ` +
                             `to ${vendor.companyName}, ` +
                             `device ${device.id}`
                         );
@@ -614,6 +736,9 @@ async function sendLeadPushToVendor(
                         console.error(
                             `❌ APNs failed for lead ${lead.id}:`,
                             {
+                                requestId:
+                                request.id,
+
                                 vendorId:
                                 vendor.vendorId,
 
@@ -634,6 +759,9 @@ async function sendLeadPushToVendor(
 
                     return {
                         channel: "apns",
+
+                        requestId:
+                            String(request.id),
 
                         vendorId:
                         vendor.vendorId,
@@ -702,6 +830,20 @@ function buildSmsPayload(
         PROD_ALERT_URL
     );
 
+    console.log(
+        "🗓️ Lead lookback:",
+        LEAD_LOOKBACK_DAYS === 0
+            ? "all history"
+            : `${LEAD_LOOKBACK_DAYS} day(s)`
+    );
+
+    if (ONLY_COMPANY) {
+        console.log(
+            "🏢 Company-only filter:",
+            ONLY_COMPANY
+        );
+    }
+
     try {
         await pool.query(
             "SELECT NOW()"
@@ -769,59 +911,80 @@ function buildSmsPayload(
                     ''
                   ) IS NOT NULL
 
-              AND scraped_at >=
-                  NOW() - INTERVAL '40 days'
+              AND (
+                $1::integer = 0
+                OR scraped_at >=
+                   NOW() - ($1::integer * INTERVAL '1 day')
+                )
 
               AND COALESCE(
-                lead_sent,
-                FALSE
-                ) = FALSE
+                          lead_sent,
+                          FALSE
+                  ) = FALSE
 
               AND UPPER(
-                BTRIM(state)
-                ) = 'TX'
+                          BTRIM(state)
+                  ) = 'TX'
 
               AND EXISTS (
                 SELECT 1
 
                 FROM unnest(
-                COALESCE(
-                company_name,
-                ARRAY[]::text[]
-                )
-                ) AS company(value)
+                             COALESCE(
+                                     company_name,
+                                     ARRAY[]::text[]
+                             )
+                     ) AS company(value)
 
                 WHERE NULLIF(
-                BTRIM(company.value),
-                ''
-                ) IS NOT NULL
+                              BTRIM(company.value),
+                              ''
+                      ) IS NOT NULL
+            )
+
+              AND (
+                NULLIF(BTRIM($2::text), '') IS NULL
+                    OR EXISTS (
+                    SELECT 1
+                    FROM unnest(
+                                 COALESCE(
+                                         company_name,
+                                         ARRAY[]::text[]
+                                 )
+                         ) AS filtered_company(value)
+                    WHERE LOWER(BTRIM(filtered_company.value)) =
+                          LOWER(BTRIM($2::text))
+                )
                 )
 
               AND EXISTS (
                 SELECT 1
 
                 FROM unnest(
-                COALESCE(
-                professionalnumbertocall,
-                ARRAY[]::text[]
-                )
-                ) AS professional(value)
+                             COALESCE(
+                                     professionalnumbertocall,
+                                     ARRAY[]::text[]
+                             )
+                     ) AS professional(value)
 
                 WHERE LENGTH(
-                regexp_replace(
-                COALESCE(
-                professional.value,
-                ''
-                ),
-                '[^0-9]',
-                '',
-                'g'
-                )
-                ) >= 10
-                )
+                              regexp_replace(
+                                      COALESCE(
+                                              professional.value,
+                                              ''
+                                      ),
+                                      '[^0-9]',
+                                      '',
+                                      'g'
+                              )
+                      ) >= 10
+            )
 
             ORDER BY id ASC
-        `);
+        `, [
+            LEAD_LOOKBACK_DAYS,
+            ONLY_COMPANY
+        ]);
 
         if (!leads.length) {
             console.log(
@@ -1012,10 +1175,22 @@ function buildSmsPayload(
                 of matchedVendors.values()
                 ) {
                 try {
+                    const request =
+                        await createOrUpdateVendorInboxRequest(
+                            lead,
+                            vendor
+                        );
+
+                    console.log(
+                        `✅ Vendor inbox request ${request.id} ` +
+                        `ready for ${vendor.companyName}`
+                    );
+
                     const vendorResults =
                         await sendLeadPushToVendor(
                             lead,
-                            vendor
+                            vendor,
+                            request
                         );
 
                     allPushResults.push(
@@ -1149,16 +1324,21 @@ function buildSmsPayload(
                             smsPayload
                         );
 
-                    console.log(
-                        "🧪 FULL TWILIO API RESPONSE:"
-                    );
+                    console.log("🧪 FULL TWILIO API RESULT:");
 
                     console.dir(
-                        twilioApiResult?.data,
-                        {
-                            depth: null
-                        }
+                        twilioApiResult,
+                        { depth: null }
                     );
+
+                    if (!twilioApiResult?.ok) {
+                        console.error(
+                            `❌ Twilio request failed for lead ${lead.id}:`,
+                            twilioApiResult?.error ||
+                            twilioApiResult?.data ||
+                            twilioApiResult
+                        );
+                    }
 
                     twilioResults =
                         Array.isArray(
@@ -1191,6 +1371,7 @@ function buildSmsPayload(
                 of twilioResults
                 ) {
                 const responsePhone =
+                    responseResult?.destination_phone ||
                     responseResult?.phone ||
                     null;
 
