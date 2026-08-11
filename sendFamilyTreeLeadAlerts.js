@@ -1115,10 +1115,30 @@ function buildSmsPayload(
                         normalizedPhone
                     ) || [];
 
-                if (vendorMatches.length) {
+                const vendorMatches =
+                    vendorsByPhone.get(
+                        normalizedPhone
+                    ) || [];
+
+                /*
+                 * Only treat the recipient as app-only when at least
+                 * one active APNs device is actually registered.
+                 *
+                 * If the vendor exists in hoa_vendors but has not
+                 * downloaded/signed into the app yet, allow the
+                 * normal Twilio fallback below.
+                 */
+                const vendorsWithActiveDevices =
+                    vendorMatches.filter(
+                        (vendor) =>
+                            Array.isArray(vendor.devices) &&
+                            vendor.devices.length > 0
+                    );
+
+                if (vendorsWithActiveDevices.length) {
                     for (
                         const vendor
-                        of vendorMatches
+                        of vendorsWithActiveDevices
                         ) {
                         matchedVendors.set(
                             vendor.vendorId,
@@ -1128,23 +1148,24 @@ function buildSmsPayload(
                         console.log(
                             `🔀 ${originalPhone} matches ` +
                             `hoa_vendors.id=${vendor.vendorId} ` +
-                            `(${vendor.companyName}) — using APNs`
+                            `(${vendor.companyName}) with ` +
+                            `${vendor.devices.length} active APNs device(s) — using app push`
                         );
                     }
 
                     /*
-                     * Do not add this number to smsRecipients.
-                     * This prevents Twilio from texting the vendor.
+                     * Vendor has the app and an active device.
+                     * Do not also send the lead through Twilio.
                      */
                     continue;
                 }
 
-                if (
-                    seenSmsPhones.has(
-                        normalizedPhone
-                    )
-                ) {
-                    continue;
+                if (vendorMatches.length) {
+                    console.log(
+                        `📲 ${originalPhone} matches an HOA vendor, ` +
+                        `but no active APNs device is registered — ` +
+                        `falling back to Twilio`
+                    );
                 }
 
                 seenSmsPhones.add(
