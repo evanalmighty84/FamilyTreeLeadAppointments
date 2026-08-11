@@ -1110,10 +1110,7 @@ function buildSmsPayload(
                     }
                 }
 
-                const vendorMatches =
-                    vendorsByPhone.get(
-                        normalizedPhone
-                    ) || [];
+
 
                 const vendorMatches =
                     vendorsByPhone.get(
