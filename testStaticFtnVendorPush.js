@@ -25,28 +25,36 @@ const pool = require("./db/db.js");
 const { sendVendorPush } = require("./services/apnsService");
 
 const fakeLead = {
-    /*
-     * Date.now() is a safe integer at current dates and fits PostgreSQL BIGINT.
-     * A new value is produced on each run so every test creates a separate inbox row.
-     */
-    id: Date.now(),
+    id: 4602,
 
-    name: "Jordan Test Homeowner",
-    phone: "2145550198",
+    name: "Harold Devoz Jr",
+    phone: "(469) 951-9850",
 
-    lead_type: "Tree Service",
-    city: "Plano",
+    lead_type: "landscaping,plumber",
+    city: "Allen",
     state: "TX",
 
     description:
-        "Homeowner is looking for tree trimming and yard cleanup.",
+        "Have an issue with our irrigation sprinkler system. " +
+        "The previous owner extended our backyard patio over the built-in sprinkler system. " +
+        "Somehow one of the pipes got disconnected and sprung a water leak. " +
+        "There is no way for us to get to it as it is underneath concrete. " +
+        "I assume we need it re-routed. Any recommendations? Any cost estimates?",
 
-    location: "Plano, TX",
-    physical_address: "123 Test Street, Plano, TX 75023",
+    location: null,
+    physical_address: null,
 
-    company_name: ["Aspen Tree Service"],
-    professionalnumbertocall: ["4807805775"],
-    networkingsource: ["Static FTN Push Test"]
+    company_name: [
+        "Aspen Tree Service",
+        "3G Plumbing"
+    ],
+
+    professionalnumbertocall: [
+        "4807805775",
+        "214-356-6967"
+    ],
+
+    networkingsource: null
 };
 
 function normalizePhone(value) {
